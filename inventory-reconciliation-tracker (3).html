@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>HCSS E360 - Inventory Reconciliation</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0B1120}#root{min-height:100vh}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef, useEffect } = React;
+
+const DEFAULT_DIVS = [
+  { id: "hauling", name: "Hauling" },
+  { id: "heavy_equipment", name: "Heavy Equipment" },
+  { id: "crushing", name: "Crushing" },
+  { id: "holmes_disposal", name: "Holmes Disposal" },
+  { id: "vinagro", name: "Vinagro Materials" },
+  { id: "building_q", name: "Building Q" },
+  { id: "tire_shop", name: "The Tire Shop" },
+  { id: "he_tire_shop", name: "Heavy Equipment Tire Shop" },
+];
+const ADMIN_PIN = "8360";
+const COLORS = ["#2563EB","#059669","#7C3AED","#DC2626","#F59E0B","#EC4899","#14B8A6","#F97316","#6366F1","#10B981"];
+const SKEY = d => `recon-${d}`;
+const DKEY = "recon-divisions";
+
+// Storage abstraction — works with both window.storage (Claude) and localStorage (standalone)
+const store = {
+  async get(key) {
+    if (typeof window !== "undefined" && window.storage) {
+      return window.storage.get(key);
+    }
+    return { value: localStorage.getItem(key) };
+  },
+  async set(key, value) {
+    if (typeof window !== "undefined" && window.storage) {
+      return window.storage.set(key, value);
+    }
+    localStorage.setItem(key, value);
+    return true;
+  }
+};
+
+// ── CSV ─────────────────────────────────────────────────────
+function splitCSV(row) { const c=[]; let s="",q=false; for(let i=0;i<row.length;i++){const ch=row[i]; if(ch==='"'){if(q&&row[i+1]==='"'){s+='"';i++;}else q=!q;} else if((ch===","||ch==="\t")&&!q){c.push(s.trim());s="";}else s+=ch;} c.push(s.trim()); return c; }
+function parseCSV(text) {
+  if (!text?.trim()) return { items:[], error:"No data" };
+  const al = text.trim().split(/\r?\n/).filter(l=>l.trim());
+  if (al.length<2) return { items:[], error:"Need header + data." };
+  let hi=0; for(let i=0;i<Math.min(5,al.length);i++){if(splitCSV(al[i]).filter(c=>c).length>=3){hi=i;break;}}
+  const lines=al.slice(hi); if(lines.length<2) return {items:[],error:"No data rows."};
+  const hdr=splitCSV(lines[0]),hm={};
+  for(let i=0;i<hdr.length;i++){const h=hdr[i].toLowerCase().replace(/[^a-z0-9]/g,"");if(!h)continue;
+    if(!hm.loc&&/^(invlocation|inventorylocation|location|warehouse|yard|site)$/.test(h))hm.loc=i;
+    else if(!hm.id&&/^(part|partnumber|partnum|partno|partid|itemid|itemnum|itemno|itemnumber|itemcode|sku|stocknum|materialid)$/.test(h))hm.id=i;
+    else if(!hm.desc&&/^(partname|partdesc|partdescription|description|desc|itemname|itemdesc|name|materialname|material)$/.test(h))hm.desc=i;
+    else if(!hm.cat&&/^(category|partcategory|cat|type|group|class|itemcategory)$/.test(h))hm.cat=i;
+    else if(!hm.qty&&/^(onhand|onhandquantity|onhandqty|qty|quantity|systemqty|qtyonhand|available|balance|count)$/.test(h))hm.qty=i;
+    else if(!hm.bin&&/^(bin|binlocation|binloc|binno|slot|shelf)$/.test(h))hm.bin=i;
+    else if(!hm.cost&&/^(lastunitcost|unitcost|cost|price|unitprice|avgcost|lastcost|standardcost)$/.test(h))hm.cost=i;
+    else if(!hm.date&&/^(lasttransactiondate|lasttransaction|lastdate|transdate|transactiondate|lastactivity|lastmodified)$/.test(h))hm.date=i;
+  }
+  if(hm.id===undefined)hm.id=hdr.length>1?1:0; if(hm.desc===undefined)hm.desc=hdr.length>2?2:0;
+  if(hm.qty===undefined){for(let c=0;c<hdr.length;c++){if(Object.values(hm).includes(c))continue;const v=lines.slice(1,6).map(l=>splitCSV(l)[c]).filter(Boolean);if(v.length&&v.every(x=>!isNaN(parseFloat(x.replace(/[$,]/g,"")))))  {hm.qty=c;break;}}}
+  const items=[];
+  for(let i=1;i<lines.length;i++){const c=splitCSV(lines[i]);if(c.filter(x=>x).length<2)continue;const id=c[hm.id]||"",desc=c[hm.desc]||"";if(!id&&!desc)continue;
+    items.push({id:`i-${Date.now()}-${i}`,itemId:id||`ITEM-${i}`,description:desc&&desc!==id?desc:(id||`Item ${i}`),invLocation:hm.loc!==undefined?(c[hm.loc]||""):"",category:hm.cat!==undefined?(c[hm.cat]||""):"",systemQty:hm.qty!==undefined?(parseFloat((c[hm.qty]||"").replace(/[$,]/g,""))||0):0,physicalQty:null,binLocation:hm.bin!==undefined?(c[hm.bin]||""):"",unitCost:hm.cost!==undefined?(parseFloat((c[hm.cost]||"").replace(/[$,]/g,""))||0):0,lastTransaction:hm.date!==undefined?(c[hm.date]||""):"",actualBin:"",notes:"",status:"pending",foundOnShelf:false,dupeBins:null});}
+  return{items,mapped:Object.fromEntries(Object.entries(hm).filter(([,v])=>hdr[v]?.trim()).map(([k,v])=>[k,hdr[v]])),error:items.length===0?"No items parsed.":null};
+}
+
+// ── CALC HELPERS ────────────────────────────────────────────
+function calcStats(items,bd){const ct=items.filter(i=>i.physicalQty!==null),vr=ct.filter(i=>i.physicalQty!==i.systemQty),zo=vr.filter(i=>i.physicalQty===0&&i.systemQty>0),cf=ct.filter(i=>i.physicalQty===i.systemQty),aj=items.filter(i=>i.status==="adjusted"),bm=items.filter(i=>i.actualBin&&i.actualBin!==i.binLocation),zc=items.filter(i=>!i.unitCost||i.unitCost===0),ns=items.filter(i=>i.foundOnShelf),di=vr.reduce((s,i)=>s+Math.abs(i.systemQty-i.physicalQty)*(i.unitCost||0),0),tb=bd?bd.length:new Set(items.map(i=>i.binLocation||"(No Bin)")).size,cb=bd?bd.filter(b=>b.done).length:0;return{total:items.length,counted:ct.length,variances:vr.length,zeroOut:zo.length,confirmed:cf.length,adjusted:aj.length,binMoves:bm.length,zeroCost:zc.length,notInSystem:ns.length,dollarImpact:di,uncounted:items.length-ct.length,totalBins:tb,countedBins:cb};}
+function calcActions(items){const a=[];items.forEach(item=>{const bm=item.actualBin&&item.actualBin!==item.binLocation;if(bm)a.push({...item,action:"bin_move",actionText:`Update bin — was "${item.binLocation||'(none)'}", found in "${item.actualBin}".`,priority:2,color:"#A78BFA"});if((!item.unitCost||item.unitCost===0)&&(item.physicalQty===null||item.physicalQty>0))a.push({...item,action:"zero_cost",actionText:`$0 cost — needs pricing. ${item.physicalQty!==null?item.physicalQty:item.systemQty} on hand.`,priority:2,color:"#F59E0B"});if(item.foundOnShelf){const dn=item.dupeBins?.length?` ⚠ Also in: ${item.dupeBins.join(", ")}`:"";a.push({...item,action:"found_on_shelf",actionText:`Not in E360 here. ${item.physicalQty} on hand in ${item.binLocation}.${dn}`,priority:1,color:"#E879F9"});}if(item.physicalQty===null)return;const d=item.systemQty-item.physicalQty;if(d===0&&!item.foundOnShelf)a.push({...item,action:"confirm",actionText:"Match — no adjustment needed",priority:4,color:"#34D399"});else if(item.physicalQty===0&&item.systemQty>0)a.push({...item,action:"zero_out",actionText:`Zero out — sys:${item.systemQty}, shelf:0. ($${(d*(item.unitCost||0)).toFixed(2)})`,priority:1,color:"#F87171"});else if(d>0)a.push({...item,action:"adjust_down",actionText:`Adjust DOWN — sys:${item.systemQty}, shelf:${item.physicalQty}. -${d}. ($${(d*(item.unitCost||0)).toFixed(2)})`,priority:1,color:"#FBBF24"});else if(d<0&&!item.foundOnShelf)a.push({...item,action:"adjust_up",actionText:`Adjust UP — sys:${item.systemQty}, shelf:${item.physicalQty}. +${Math.abs(d)}.`,priority:2,color:"#60A5FA"});});return a.sort((a,b)=>a.priority-b.priority);}
+
+// ── AUTO-PLAN TASKS ─────────────────────────────────────────
+function calcPlanTasks(items, stats, actionItems) {
+  const n = items.length;
+  const aj = actionItems || [];
+  const varianceActions = aj.filter(a=>["zero_out","adjust_down","adjust_up"].includes(a.action));
+  const allVarianceDone = n > 0 && varianceActions.length > 0 && varianceActions.every(a=>a.status==="adjusted");
+  const zeroCostActions = aj.filter(a=>a.action==="zero_cost");
+  const allZeroCostDone = n > 0 && zeroCostActions.length > 0 && zeroCostActions.every(a=>a.status==="adjusted");
+  const binMoveActions = aj.filter(a=>a.action==="bin_move");
+  const allBinMovesDone = n > 0 && binMoveActions.length > 0 && binMoveActions.every(a=>a.status==="adjusted");
+  const allCounted = n > 0 && stats.uncounted === 0;
+  const noVariances = allCounted && stats.variances === 0;
+  return [
+    { id:"p1", phase:1, text:"Import E360 inventory export", auto:true, done: n > 0 },
+    { id:"p2", phase:1, text:`Conduct bin-by-bin physical count (${stats.counted}/${stats.total})`, auto:true, done: allCounted },
+    { id:"p3", phase:1, text:`Verify all bins counted (${stats.countedBins}/${stats.totalBins})`, auto:true, done: n > 0 && stats.totalBins > 0 && stats.countedBins === stats.totalBins },
+    { id:"p4", phase:2, text:`Review all variances (${stats.variances} found)`, auto:true, done: allCounted },
+    { id:"p5", phase:2, text:`Review $0 cost items (${stats.zeroCost} flagged)`, auto:true, done: allZeroCostDone || (allCounted && stats.zeroCost === 0) },
+    { id:"p6", phase:2, text:`Review parts not in system (${stats.notInSystem} found)`, auto:true, done: allCounted && (stats.notInSystem === 0 || aj.filter(a=>a.action==="found_on_shelf").every(a=>a.status==="adjusted")) },
+    { id:"p7", phase:3, text:`Zero out phantom inventory (${stats.zeroOut} items)`, auto:true, done: allVarianceDone || noVariances },
+    { id:"p8", phase:3, text:`Adjust all variances (${varianceActions.filter(a=>a.status==="adjusted").length}/${varianceActions.length})`, auto:true, done: allVarianceDone || noVariances },
+    { id:"p9", phase:3, text:`Update bin locations (${binMoveActions.filter(a=>a.status==="adjusted").length}/${binMoveActions.length} moves)`, auto:true, done: allBinMovesDone || (allCounted && stats.binMoves === 0) },
+    { id:"p10", phase:3, text:"Supervisor review and approval", auto:false, done:false },
+    { id:"p11", phase:3, text:"Generate adjustment audit trail", auto:false, done:false },
+    { id:"p12", phase:4, text:"Train admin on WO-based purchasing", auto:false, done:false },
+    { id:"p13", phase:4, text:"Create and publish SOP document", auto:false, done:false },
+    { id:"p14", phase:4, text:"Implement weekly PO audit process", auto:false, done:false },
+    { id:"p15", phase:4, text:"Schedule 30-day follow-up audit", auto:false, done:false },
+  ];
+}
+
+const PHASES = [
+  { id:1, name:"Physical Count", color:"#2563EB" },
+  { id:2, name:"Reconciliation", color:"#7C3AED" },
+  { id:3, name:"Adjustments", color:"#DC2626" },
+  { id:4, name:"Training & Controls", color:"#059669" },
+];
+const Badge = ({bg,fg,text}) => <span style={{background:bg,color:fg,padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:600}}>{text}</span>;
+const StatusBadge = ({status}) => {const c={pending:["#F3F4F6","#6B7280","Pending"],confirmed:["#D1FAE5","#065F46","Match"],variance:["#FEF3C7","#92400E","Variance"],adjusted:["#DBEAFE","#1E40AF","Adjusted"]}[status]||["#F3F4F6","#6B7280","—"];return <Badge bg={c[0]} fg={c[1]} text={c[2]} />;};
+
+// ═══════════════════════════════════════════════════════════
+// DIVISION TRACKER
+// ═══════════════════════════════════════════════════════════
+function DivisionTracker({ divId, divName, onBack }) {
+  const [items, setItems] = useState([]);
+  const [manualTasks, setManualTasks] = useState({});
+  const [notes, setNotes] = useState("");
+  const [view, setView] = useState("dashboard");
+  const [csvInput, setCsvInput] = useState("");
+  const [importResult, setImportResult] = useState(null);
+  const [selectedBin, setSelectedBin] = useState(null);
+  const [binSearch, setBinSearch] = useState("");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [actionFilter, setActionFilter] = useState("all");
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+  const [showAddFound, setShowAddFound] = useState(false);
+  const [foundPart, setFoundPart] = useState({partNum:"",partName:"",category:"",qty:"",unitCost:""});
+  const [foundWarning, setFoundWarning] = useState(null);
+  const fileRef = useRef(null);
+
+  useEffect(() => {(async()=>{try{const r=await store.get(SKEY(divId));if(r?.value){const d=JSON.parse(r.value);if(d.items?.length)setItems(d.items);if(d.manualTasks)setManualTasks(d.manualTasks);if(d.notes)setNotes(d.notes);if(d.view)setView(d.view);setSaveStatus("Data restored");setTimeout(()=>setSaveStatus(""),3000);}}catch(e){}setLoaded(true);})();}, [divId]);
+  useEffect(() => {if(!loaded)return;const t=setTimeout(async()=>{try{await store.set(SKEY(divId),JSON.stringify({items,manualTasks,notes,view,divId,divName,lastSaved:new Date().toISOString()}));setSaveStatus("Saved");setTimeout(()=>setSaveStatus(""),2000);}catch(e){}},500);return()=>clearTimeout(t);}, [items,manualTasks,notes,view,loaded,divId,divName]);
+
+  const binData = useMemo(()=>{const m={};items.forEach(i=>{const b=i.binLocation||"(No Bin)";if(!m[b])m[b]={total:0,counted:0};m[b].total++;if(i.physicalQty!==null)m[b].counted++;});return Object.entries(m).sort(([a],[b])=>a.localeCompare(b)).map(([name,d])=>({name,...d,done:d.counted===d.total}));}, [items]);
+  const filteredBins = useMemo(()=>binSearch.trim()?binData.filter(b=>b.name.toLowerCase().includes(binSearch.toLowerCase())):binData, [binData,binSearch]);
+  const binItems = useMemo(()=>selectedBin?items.filter(i=>(i.binLocation||"(No Bin)")===selectedBin):[], [items,selectedBin]);
+  const stats = useMemo(()=>calcStats(items,binData), [items,binData]);
+  const actionItems = useMemo(()=>calcActions(items), [items]);
+  const filteredActions = useMemo(()=>actionFilter==="all"?actionItems:actionItems.filter(a=>a.action===actionFilter), [actionItems,actionFilter]);
+
+  // Auto-calculated plan
+  const planTasks = useMemo(()=>{
+    const auto = calcPlanTasks(items, stats, actionItems);
+    return auto.map(t => t.auto ? t : { ...t, done: !!manualTasks[t.id] });
+  }, [items, stats, actionItems, manualTasks]);
+  const phaseProgress = useMemo(()=>PHASES.map(p=>{const pt=planTasks.filter(t=>t.phase===p.id);const d=pt.filter(t=>t.done).length;return{...p,total:pt.length,done:d,pct:pt.length?Math.round(d/pt.length*100):0};}), [planTasks]);
+  const overallPct = useMemo(()=>Math.round(planTasks.filter(t=>t.done).length/planTasks.length*100), [planTasks]);
+
+  const doImport = useCallback((text)=>{const r=parseCSV(text);if(r.error){setImportResult({ok:false,msg:r.error});return;}setItems(p=>[...p,...r.items]);setImportResult({ok:true,msg:`Imported ${r.items.length} items.`});setCsvInput("");}, []);
+  const handleFile = useCallback((e)=>{const f=e.target.files[0];if(!f)return;const rd=new FileReader();rd.onload=(ev)=>{const t=ev.target.result;setCsvInput(t);doImport(t);};rd.readAsText(f);if(fileRef.current)fileRef.current.value="";}, [doImport]);
+  const updateItem = useCallback((id,field,value)=>{setItems(p=>p.map(i=>{if(i.id!==id)return i;const u={...i,[field]:value};if(field==="physicalQty"&&value!==null)u.status=value===u.systemQty?"confirmed":"variance";return u;}));}, []);
+  const markAdjusted = useCallback((id)=>updateItem(id,"status","adjusted"), [updateItem]);
+  const markRemainingZero = useCallback(()=>{setItems(p=>p.map(i=>{if((i.binLocation||"(No Bin)")!==selectedBin||i.physicalQty!==null)return i;return{...i,physicalQty:0,status:i.systemQty===0?"confirmed":"variance"};}));}, [selectedBin]);
+  const toggleManualTask = useCallback((id)=>setManualTasks(p=>({...p,[id]:!p[id]})), []);
+  const addFoundPart = useCallback(()=>{
+    if(!foundPart.partNum&&!foundPart.partName)return;
+    const pn=(foundPart.partNum||"").trim().toUpperCase();
+    const dupes=pn?items.filter(i=>i.itemId.toUpperCase()===pn&&(i.binLocation||"(No Bin)")!==selectedBin):[];
+    const dupeBins=dupes.map(i=>`${i.binLocation||"(No Bin)"} (qty:${i.systemQty})`);
+    setItems(p=>[...p,{id:`f-${Date.now()}`,itemId:pn||`FOUND-${Date.now()}`,description:foundPart.partName||pn||"Unknown",invLocation:items[0]?.invLocation||"",category:foundPart.category||"",systemQty:0,physicalQty:parseFloat(foundPart.qty)||1,binLocation:selectedBin||"(No Bin)",actualBin:"",unitCost:parseFloat(foundPart.unitCost)||0,lastTransaction:"",notes:"",status:"variance",foundOnShelf:true,dupeBins:dupeBins.length?dupeBins:null}]);
+    setFoundWarning(dupeBins.length?{partNum:pn,bins:dupeBins}:null);
+    setFoundPart({partNum:"",partName:"",category:"",qty:"",unitCost:""});
+    if(!dupeBins.length)setShowAddFound(false);
+  }, [foundPart,selectedBin,items]);
+  const exportCSV = useCallback(()=>{
+    const h="Division,Inv Location,Part #,Part Name,Category,System Qty,Physical Qty,Variance,System Bin,Actual Bin,Bin Moved,Found On Shelf,Exists Elsewhere,Unit Cost,Variance $,Last Trans,Status,Notes";
+    const rows=items.map(i=>{const v=i.physicalQty!==null?i.systemQty-i.physicalQty:"";const vd=v!==""?(v*(i.unitCost||0)):"";const mv=i.actualBin&&i.actualBin!==i.binLocation?"YES":"";
+      return`"${divName}","${i.invLocation}","${i.itemId}","${i.description}","${i.category}",${i.systemQty},${i.physicalQty??""},${v},"${i.binLocation}","${i.actualBin||i.binLocation}","${mv}","${i.foundOnShelf?"YES":""}","${i.dupeBins?.join("; ")||""}",${i.unitCost||""},${vd},"${i.lastTransaction}","${i.status}","${i.notes}"`;});
+    const blob=new Blob([h+"\n"+rows.join("\n")],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`reconciliation-${divId}.csv`;a.click();
+  }, [items,divName,divId]);
+
+  const pending = actionItems.filter(a=>a.status!=="adjusted"&&a.status!=="confirmed"&&a.action!=="confirm").length;
+  const NB = (v,l,b) => <button onClick={()=>setView(v)} style={{padding:"6px 11px",borderRadius:7,border:"1px solid",fontSize:11,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",gap:4,background:view===v?"#2563EB":"transparent",borderColor:view===v?"#2563EB":"#334155",color:view===v?"#fff":"#94A3B8"}}>{l}{b>0&&<span style={{background:view===v?"rgba(255,255,255,.25)":"#DC2626",color:"#fff",fontSize:9,fontWeight:700,padding:"1px 5px",borderRadius:8}}>{b}</span>}</button>;
+
+  return (
+    <div style={{fontFamily:"'IBM Plex Sans',-apple-system,sans-serif",background:"#0B1120",color:"#E2E8F0",minHeight:"100vh"}}>
+      <div style={{background:"linear-gradient(135deg,#0F172A,#1E293B)",borderBottom:"1px solid #1E3A5F",padding:"12px 20px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <button onClick={onBack} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #334155",background:"#1E293B",color:"#94A3B8",fontSize:11,cursor:"pointer"}}>← Divisions</button>
+            <div>
+              <div style={{fontSize:9,fontWeight:700,letterSpacing:2,color:"#60A5FA",textTransform:"uppercase"}}>{divName}</div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <h1 style={{fontSize:16,fontWeight:700,margin:0,color:"#F1F5F9"}}>Inventory Reconciliation</h1>
+                {saveStatus&&<span style={{fontSize:9,color:saveStatus.includes("estored")?"#60A5FA":"#34D399",background:"rgba(52,211,153,.1)",padding:"2px 6px",borderRadius:5}}>{saveStatus}</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>{NB("dashboard","Dashboard",0)}{NB("import","Import",0)}{NB("count","Count",stats.uncounted)}{NB("reconcile","Reconcile",0)}{NB("actions","Actions",pending)}{NB("plan","Plan",0)}</div>
+        </div>
+      </div>
+      <div style={{padding:"16px 20px",maxWidth:1280,margin:"0 auto"}}>
+
+        {/* DASHBOARD */}
+        {view==="dashboard"&&<div>
+          <div style={{background:"#1E293B",borderRadius:12,padding:18,border:"1px solid #334155",marginBottom:14}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}><span style={{fontSize:13,fontWeight:600,color:"#94A3B8"}}>Recovery Progress</span><span style={{fontSize:20,fontWeight:800,color:overallPct===100?"#34D399":"#60A5FA"}}>{overallPct}%</span></div>
+            <div style={{background:"#0F172A",borderRadius:8,height:8}}><div style={{height:"100%",width:`${overallPct}%`,background:overallPct===100?"#34D399":"linear-gradient(90deg,#2563EB,#60A5FA)",borderRadius:8,transition:"width .4s"}}/></div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:10,marginBottom:14}}>
+            {phaseProgress.map(p=><div key={p.id} style={{background:"#1E293B",borderRadius:10,padding:14,border:`1px solid ${p.pct===100?"#34D399":"#334155"}`,position:"relative",overflow:"hidden"}}><div style={{position:"absolute",top:0,left:0,right:0,height:3,background:p.color,opacity:.8}}/><div style={{fontSize:9,fontWeight:700,letterSpacing:1.5,color:p.color,textTransform:"uppercase",marginBottom:4}}>Phase {p.id}</div><div style={{fontSize:13,fontWeight:600,color:"#F1F5F9",marginBottom:6}}>{p.name}</div><div style={{display:"flex",alignItems:"center",gap:6}}><div style={{flex:1,background:"#0F172A",borderRadius:6,height:5}}><div style={{height:"100%",width:`${p.pct}%`,background:p.pct===100?"#34D399":p.color,borderRadius:6}}/></div><span style={{fontSize:11,fontWeight:700,color:p.pct===100?"#34D399":"#94A3B8"}}>{p.done}/{p.total}</span></div></div>)}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))",gap:8,marginBottom:14}}>
+            {[["Parts",stats.total,"#60A5FA"],["Counted",stats.counted,"#34D399"],["Uncounted",stats.uncounted,stats.uncounted>0?"#FBBF24":"#34D399"],["Bins",`${stats.countedBins}/${stats.totalBins}`,"#A78BFA"],["Match",stats.confirmed,"#34D399"],["Variance",stats.variances,stats.variances>0?"#F87171":"#34D399"],["Zero Out",stats.zeroOut,stats.zeroOut>0?"#F87171":"#34D399"],["Not In Sys",stats.notInSystem,stats.notInSystem>0?"#E879F9":"#34D399"],["$0 Cost",stats.zeroCost,stats.zeroCost>0?"#F59E0B":"#34D399"],["Bin Moves",stats.binMoves,stats.binMoves>0?"#A78BFA":"#34D399"],["Adjusted",stats.adjusted,"#A78BFA"],["$ Impact",`$${stats.dollarImpact.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`,"#F87171"]].map(([l,v,c],i)=><div key={i} style={{background:"#1E293B",borderRadius:8,padding:10,border:"1px solid #334155",textAlign:"center"}}><div style={{fontSize:8,fontWeight:600,color:"#64748B",textTransform:"uppercase",letterSpacing:.8,marginBottom:2}}>{l}</div><div style={{fontSize:16,fontWeight:800,color:c}}>{v}</div></div>)}
+          </div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            {!items.length&&<button onClick={()=>setView("import")} style={{padding:"9px 18px",borderRadius:8,border:"none",background:"#2563EB",color:"#fff",fontWeight:600,fontSize:12,cursor:"pointer"}}>1. Import E360</button>}
+            {items.length>0&&stats.uncounted>0&&<button onClick={()=>setView("count")} style={{padding:"9px 18px",borderRadius:8,border:"none",background:"#2563EB",color:"#fff",fontWeight:600,fontSize:12,cursor:"pointer"}}>2. Count ({stats.uncounted} left)</button>}
+            {pending>0&&<button onClick={()=>setView("actions")} style={{padding:"9px 18px",borderRadius:8,border:"none",background:"#DC2626",color:"#fff",fontWeight:600,fontSize:12,cursor:"pointer"}}>3. Actions ({pending})</button>}
+            {items.length>0&&<button onClick={exportCSV} style={{padding:"9px 18px",borderRadius:8,border:"1px solid #334155",background:"transparent",color:"#94A3B8",fontWeight:600,fontSize:12,cursor:"pointer"}}>Export CSV</button>}
+          </div>
+        </div>}
+
+        {/* IMPORT */}
+        {view==="import"&&<div>
+          <h2 style={{fontSize:16,fontWeight:700,color:"#F1F5F9",margin:"0 0 12px"}}>Import E360 Inventory</h2>
+          <div style={{background:"#1E293B",borderRadius:12,padding:18,border:"1px solid #334155",marginBottom:14}}>
+            <div style={{display:"flex",gap:10,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+              <input ref={fileRef} type="file" accept=".csv,.tsv,.txt" onChange={handleFile} style={{display:"none"}}/>
+              <button onClick={()=>fileRef.current?.click()} style={{padding:"10px 20px",borderRadius:8,border:"2px dashed #334155",background:"#0F172A",color:"#60A5FA",fontSize:13,fontWeight:600,cursor:"pointer"}}>Upload CSV (auto-imports)</button>
+              <span style={{fontSize:11,color:"#475569"}}>or paste below</span>
+            </div>
+            <textarea value={csvInput} onChange={e=>{setCsvInput(e.target.value);setImportResult(null);}} placeholder="Paste CSV..." rows={3} style={{width:"100%",background:"#0F172A",border:"1px solid #334155",borderRadius:8,padding:8,color:"#E2E8F0",fontFamily:"monospace",fontSize:11,resize:"vertical",boxSizing:"border-box"}}/>
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              <button onClick={()=>doImport(csvInput)} disabled={!csvInput.trim()} style={{padding:"8px 18px",borderRadius:8,border:"none",background:csvInput.trim()?"#2563EB":"#1E3A5F",color:csvInput.trim()?"#fff":"#475569",fontWeight:600,fontSize:12,cursor:csvInput.trim()?"pointer":"default"}}>Import</button>
+              {items.length>0&&<button onClick={()=>{setItems([]);setImportResult(null);}} style={{padding:"8px 18px",borderRadius:8,border:"1px solid #DC2626",background:"transparent",color:"#F87171",fontWeight:600,fontSize:12,cursor:"pointer"}}>Clear ({items.length})</button>}
+            </div>
+            {importResult&&<div style={{marginTop:10,padding:10,borderRadius:8,border:`1px solid ${importResult.ok?"#34D399":"#F87171"}`,background:importResult.ok?"rgba(52,211,153,.08)":"rgba(248,113,113,.08)"}}><span style={{fontSize:12,fontWeight:600,color:importResult.ok?"#34D399":"#F87171"}}>{importResult.ok?"✓":"✕"} {importResult.msg}</span></div>}
+          </div>
+          {items.length>0&&<div style={{background:"#1E293B",borderRadius:12,padding:16,border:"1px solid #334155"}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#F1F5F9"}}>{items.length} parts, {stats.totalBins} bins</div>
+            {stats.zeroCost>0&&<div style={{fontSize:11,color:"#F59E0B",marginTop:4}}>⚠ {stats.zeroCost} parts @ $0 cost</div>}
+            <button onClick={()=>setView("count")} style={{marginTop:10,padding:"9px 18px",borderRadius:8,border:"none",background:"#059669",color:"#fff",fontWeight:600,fontSize:12,cursor:"pointer"}}>Start Counting →</button>
+          </div>}
+        </div>}
+
+        {/* COUNT */}
+        {view==="count"&&<div>
+          <h2 style={{fontSize:16,fontWeight:700,color:"#F1F5F9",margin:"0 0 4px"}}>Physical Count</h2>
+          <p style={{fontSize:11,color:"#64748B",margin:"0 0 12px"}}>{selectedBin?"Enter counts. ← to go back.":"Select a bin."}</p>
+          {!selectedBin?<div>
+            <div style={{marginBottom:10,display:"flex",gap:8,alignItems:"center"}}>
+              <input value={binSearch} onChange={e=>setBinSearch(e.target.value)} placeholder="Search bins..." style={{flex:1,maxWidth:280,padding:"7px 10px",borderRadius:8,border:"1px solid #334155",background:"#0F172A",color:"#E2E8F0",fontSize:12}}/>
+              <span style={{fontSize:11,color:"#64748B"}}>{binData.filter(b=>b.done).length}/{binData.length} done</span>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:5}}>
+              {filteredBins.map(b=><div key={b.name} onClick={()=>setSelectedBin(b.name)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 14px",borderRadius:8,background:"#1E293B",border:`1px solid ${b.done?"#34D399":"#334155"}`,cursor:"pointer"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:7,height:7,borderRadius:4,background:b.done?"#34D399":b.counted>0?"#FBBF24":"#475569"}}/><span style={{fontSize:13,fontWeight:600,color:"#F1F5F9"}}>{b.name}</span></div>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:11,color:b.done?"#34D399":"#94A3B8",fontWeight:600}}>{b.counted}/{b.total}</span>{b.done&&<span style={{color:"#34D399"}}>✓</span>}<span style={{color:"#475569"}}>→</span></div>
+              </div>)}
+              {!filteredBins.length&&<div style={{padding:20,textAlign:"center",color:"#64748B"}}>{items.length?'No bins match.':'Import data first.'}</div>}
+            </div>
+          </div>:<div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:6}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <button onClick={()=>{setSelectedBin(null);setShowAddFound(false);setFoundWarning(null);}} style={{padding:"5px 10px",borderRadius:6,border:"1px solid #334155",background:"#1E293B",color:"#94A3B8",fontSize:11,cursor:"pointer"}}>← Bins</button>
+                <span style={{fontSize:15,fontWeight:700,color:"#F1F5F9"}}>{selectedBin}</span>
+                <span style={{fontSize:11,color:"#64748B"}}>{binItems.filter(i=>i.physicalQty!==null).length}/{binItems.length}</span>
+              </div>
+              {binItems.some(i=>i.physicalQty===null)&&<button onClick={markRemainingZero} style={{padding:"5px 12px",borderRadius:6,border:"1px solid #DC2626",background:"transparent",color:"#F87171",fontSize:10,fontWeight:600,cursor:"pointer"}}>Mark rest as 0</button>}
+            </div>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead><tr style={{borderBottom:"2px solid #334155"}}>
+                  {["Part #","Part Name","Cat","Sys Bin","Actual Bin","E360","Count","Var","Status"].map(h=><th key={h} style={{padding:"8px 6px",textAlign:"left",fontSize:9,fontWeight:700,color:"#64748B",textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>)}
+                </tr></thead>
+                <tbody>{binItems.map(item=>{const v=item.physicalQty!==null?item.systemQty-item.physicalQty:null;const bm=item.actualBin&&item.actualBin!==item.binLocation;const zc=!item.unitCost||item.unitCost===0;
+                  return <tr key={item.id} style={{borderBottom:"1px solid #1E3A5F",background:bm?"rgba(96,165,250,.06)":item.status==="variance"?"rgba(251,191,36,.04)":item.status==="confirmed"?"rgba(52,211,153,.04)":"transparent"}}>
+                    <td style={{padding:"8px 6px",fontWeight:600,color:"#E2E8F0",fontFamily:"monospace",fontSize:11}}>{item.itemId}{zc&&<span style={{marginLeft:4,color:"#F59E0B",fontSize:8,fontWeight:700}}>$0</span>}{item.foundOnShelf&&<span style={{marginLeft:4,color:"#E879F9",fontSize:8,fontWeight:700}}>NEW</span>}</td>
+                    <td style={{padding:"8px 6px",color:"#94A3B8",maxWidth:160,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={item.description}>{item.description}</td>
+                    <td style={{padding:"8px 6px",color:"#64748B",fontSize:10}}>{item.category}</td>
+                    <td style={{padding:"8px 6px",color:bm?"#475569":"#64748B",fontSize:10,textDecoration:bm?"line-through":"none"}}>{item.binLocation||"—"}</td>
+                    <td style={{padding:"8px 6px"}}><input type="text" value={item.actualBin??""} onChange={e=>updateItem(item.id,"actualBin",e.target.value||"")} placeholder={item.binLocation||"bin"} style={{width:70,padding:"4px 6px",borderRadius:5,border:`1px solid ${bm?"#60A5FA":"#334155"}`,background:"#0F172A",color:bm?"#60A5FA":"#E2E8F0",fontSize:11}}/></td>
+                    <td style={{padding:"8px 6px",color:"#94A3B8",textAlign:"right",fontFamily:"monospace",fontWeight:600}}>{item.systemQty}</td>
+                    <td style={{padding:"8px 6px"}}><input type="number" min="0" value={item.physicalQty??""} onChange={e=>updateItem(item.id,"physicalQty",e.target.value===""?null:parseFloat(e.target.value))} placeholder="ct" style={{width:75,padding:"5px 8px",borderRadius:5,border:`2px solid ${item.physicalQty!==null?(v===0?"#34D399":"#FBBF24"):"#334155"}`,background:"#0F172A",color:"#E2E8F0",textAlign:"right",fontFamily:"monospace",fontSize:13,fontWeight:700}}/></td>
+                    <td style={{padding:"8px 6px",textAlign:"right",fontFamily:"monospace",fontWeight:700,fontSize:13,color:v===null?"#475569":v===0?"#34D399":"#F87171"}}>{v!==null?(v===0?"✓":v>0?`−${v}`:`+${Math.abs(v)}`):"—"}</td>
+                    <td style={{padding:"8px 6px"}}><div style={{display:"flex",alignItems:"center",gap:3,flexWrap:"wrap"}}><StatusBadge status={item.status}/>{bm&&<Badge bg="#1E3A5F" fg="#60A5FA" text="MOVED"/>}{item.dupeBins&&<Badge bg="#DC262620" fg="#F87171" text="DUPE"/>}</div></td>
+                  </tr>;})}</tbody>
+              </table>
+            </div>
+            {/* ADD FOUND PART */}
+            <div style={{marginTop:14}}>
+              {!showAddFound?<button onClick={()=>{setShowAddFound(true);setFoundWarning(null);}} style={{padding:"9px 18px",borderRadius:8,border:"2px dashed #334155",background:"transparent",color:"#E879F9",fontSize:12,fontWeight:600,cursor:"pointer",width:"100%"}}>+ Part on shelf not in list?</button>
+              :<div style={{background:"#1E293B",borderRadius:10,padding:14,border:"1px solid #E879F930"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><span style={{fontSize:13,fontWeight:600,color:"#E879F9"}}>Add Found Part</span><button onClick={()=>{setShowAddFound(false);setFoundWarning(null);}} style={{background:"none",border:"none",color:"#64748B",cursor:"pointer",fontSize:14}}>✕</button></div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:8,marginBottom:10}}>
+                  {[{k:"partNum",l:"Part #",p:"e.g. A4731800909"},{k:"partName",l:"Name",p:"e.g. OIL FILTER"},{k:"category",l:"Category",p:"FILTERS"},{k:"qty",l:"Qty",p:"1",t:"number"},{k:"unitCost",l:"Cost ($)",p:"0.00",t:"number"}].map(f=><div key={f.k}><label style={{fontSize:9,fontWeight:600,color:"#64748B",textTransform:"uppercase",display:"block",marginBottom:2}}>{f.l}</label><input type={f.t||"text"} value={foundPart[f.k]} onChange={e=>setFoundPart(p=>({...p,[f.k]:e.target.value}))} placeholder={f.p} style={{width:"100%",padding:"6px 8px",borderRadius:5,border:"1px solid #334155",background:"#0F172A",color:"#E2E8F0",fontSize:11,boxSizing:"border-box"}}/></div>)}
+                </div>
+                {foundWarning&&<div style={{padding:10,borderRadius:8,border:"1px solid #F87171",background:"rgba(248,113,113,.08)",marginBottom:10}}><div style={{fontSize:12,fontWeight:700,color:"#F87171"}}>⚠ DUPLICATE — {foundWarning.partNum} exists:</div>{foundWarning.bins.map((b,i)=><div key={i} style={{fontSize:11,color:"#FBBF24",marginLeft:6}}>• {b}</div>)}<div style={{fontSize:10,color:"#94A3B8",marginTop:4}}>Added & flagged. Check if wrong location.</div></div>}
+                <button onClick={addFoundPart} disabled={!foundPart.partNum&&!foundPart.partName} style={{padding:"8px 18px",borderRadius:8,border:"none",background:(foundPart.partNum||foundPart.partName)?"#E879F9":"#334155",color:(foundPart.partNum||foundPart.partName)?"#0F172A":"#64748B",fontWeight:700,fontSize:12,cursor:(foundPart.partNum||foundPart.partName)?"pointer":"default"}}>Add to {selectedBin}</button>
+              </div>}
+            </div>
+          </div>}
+        </div>}
+
+        {/* RECONCILE */}
+        {view==="reconcile"&&<div>
+          <h2 style={{fontSize:16,fontWeight:700,color:"#F1F5F9",margin:"0 0 12px"}}>Reconciliation</h2>
+          <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+            <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{padding:"7px 10px",borderRadius:6,border:"1px solid #334155",background:"#1E293B",color:"#94A3B8",fontSize:11}}>
+              <option value="all">All ({items.length})</option><option value="pending">Uncounted ({items.filter(i=>i.status==="pending").length})</option><option value="confirmed">Match ({items.filter(i=>i.status==="confirmed").length})</option><option value="variance">Variance ({items.filter(i=>i.status==="variance").length})</option><option value="adjusted">Adjusted ({items.filter(i=>i.status==="adjusted").length})</option><option value="zero_cost">$0 Cost ({stats.zeroCost})</option><option value="found">Not In Sys ({stats.notInSystem})</option>
+            </select>
+            <button onClick={exportCSV} disabled={!items.length} style={{padding:"7px 14px",borderRadius:6,border:"1px solid #334155",background:"#1E293B",color:"#94A3B8",fontSize:11,fontWeight:600,cursor:"pointer"}}>Export CSV</button>
+          </div>
+          {!items.length?<div style={{background:"#1E293B",borderRadius:12,padding:28,textAlign:"center",border:"1px solid #334155",color:"#64748B"}}>Import & count first.</div>:
+          <div style={{overflowX:"auto"}}><table style={{width:"100%",borderCollapse:"collapse",fontSize:11,minWidth:900}}>
+            <thead><tr style={{borderBottom:"2px solid #334155"}}>{["Loc","Part #","Name","Cat","Bin","E360","Ct","Var","Cost","$ Impact","Last","Status",""].map(h=><th key={h} style={{padding:"7px 4px",textAlign:"left",fontSize:8,fontWeight:700,color:"#64748B",textTransform:"uppercase",whiteSpace:"nowrap"}}>{h}</th>)}</tr></thead>
+            <tbody>{(filterStatus==="all"?items:filterStatus==="zero_cost"?items.filter(i=>!i.unitCost||i.unitCost===0):filterStatus==="found"?items.filter(i=>i.foundOnShelf):items.filter(i=>i.status===filterStatus)).map(item=>{const v=item.physicalQty!==null?item.systemQty-item.physicalQty:null;const d=v!==null?v*(item.unitCost||0):null;const zc=!item.unitCost||item.unitCost===0;
+              return <tr key={item.id} style={{borderBottom:"1px solid #1E3A5F",background:zc?"rgba(245,158,11,.04)":""}}>
+                <td style={{padding:"6px 4px",color:"#64748B",fontSize:9}}>{item.invLocation}</td>
+                <td style={{padding:"6px 4px",fontWeight:600,color:"#E2E8F0",fontFamily:"monospace",fontSize:10}}>{item.itemId}{item.foundOnShelf&&<span style={{color:"#E879F9",fontSize:8,marginLeft:3}}>NEW</span>}{zc&&<span style={{color:"#F59E0B",fontSize:8,marginLeft:3}}>$0</span>}</td>
+                <td style={{padding:"6px 4px",color:"#94A3B8",maxWidth:100,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontSize:10}} title={item.description}>{item.description}</td>
+                <td style={{padding:"6px 4px",color:"#64748B",fontSize:9}}>{item.category}</td>
+                <td style={{padding:"6px 4px",color:"#64748B",fontSize:9}}>{item.actualBin&&item.actualBin!==item.binLocation?<><s>{item.binLocation}</s>→<strong style={{color:"#60A5FA"}}>{item.actualBin}</strong></>:item.binLocation}</td>
+                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"monospace",color:"#94A3B8"}}>{item.systemQty}</td>
+                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"monospace",fontWeight:700,color:item.physicalQty!==null?"#E2E8F0":"#475569"}}>{item.physicalQty??"—"}</td>
+                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"monospace",fontWeight:700,color:v===null?"#475569":v===0?"#34D399":"#F87171"}}>{v!==null?(v>0?`+${v}`:v):"—"}</td>
+                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"monospace",fontSize:10,color:zc?"#F59E0B":"#94A3B8"}}>{item.unitCost?`$${item.unitCost.toFixed(2)}`:<b>$0</b>}</td>
+                <td style={{padding:"6px 4px",textAlign:"right",fontFamily:"monospace",fontWeight:600,color:d===null?"#475569":d===0?"#34D399":"#F87171"}}>{d!==null?`$${Math.abs(d).toFixed(2)}`:""}</td>
+                <td style={{padding:"6px 4px",color:"#64748B",fontSize:9,whiteSpace:"nowrap"}}>{item.lastTransaction}</td>
+                <td style={{padding:"6px 4px"}}><StatusBadge status={item.status}/></td>
+                <td style={{padding:"6px 4px"}}>{item.status==="variance"&&<button onClick={()=>markAdjusted(item.id)} style={{padding:"2px 7px",borderRadius:4,border:"none",background:"#7C3AED",color:"#fff",fontSize:9,fontWeight:600,cursor:"pointer"}}>Done</button>}{item.status==="adjusted"&&<span style={{color:"#A78BFA",fontSize:9}}>✓</span>}</td>
+              </tr>;})}</tbody>
+          </table></div>}
+        </div>}
+
+        {/* ACTIONS */}
+        {view==="actions"&&<div>
+          <h2 style={{fontSize:16,fontWeight:700,color:"#F1F5F9",margin:"0 0 12px"}}>Action Items</h2>
+          {!actionItems.length?<div style={{background:"#1E293B",borderRadius:12,padding:36,textAlign:"center",border:"1px solid #334155"}}><div style={{fontSize:24,marginBottom:6}}>{!items.length?"📦":stats.counted===0?"📋":"✅"}</div><div style={{color:"#64748B",fontSize:12}}>{!items.length?"Import data first.":stats.counted===0?"Count first.":"All good!"}</div></div>
+          :<><div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+            {[["all",`All (${actionItems.length})`,"#94A3B8"],["zero_out",`Zero Out (${actionItems.filter(a=>a.action==="zero_out").length})`,"#F87171"],["adjust_down",`Down (${actionItems.filter(a=>a.action==="adjust_down").length})`,"#FBBF24"],["adjust_up",`Up (${actionItems.filter(a=>a.action==="adjust_up").length})`,"#60A5FA"],["found_on_shelf",`Not In Sys (${actionItems.filter(a=>a.action==="found_on_shelf").length})`,"#E879F9"],["zero_cost",`$0 (${actionItems.filter(a=>a.action==="zero_cost").length})`,"#F59E0B"],["bin_move",`Moves (${actionItems.filter(a=>a.action==="bin_move").length})`,"#A78BFA"],["confirm",`Match (${actionItems.filter(a=>a.action==="confirm").length})`,"#34D399"]].map(([v,l,c])=><button key={v} onClick={()=>setActionFilter(v)} style={{padding:"6px 10px",borderRadius:7,fontSize:10,fontWeight:600,cursor:"pointer",border:`1px solid ${actionFilter===v?c:"#334155"}`,background:actionFilter===v?`${c}15`:"#1E293B",color:actionFilter===v?c:"#64748B"}}>{l}</button>)}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {filteredActions.map(a=><div key={`${a.id}-${a.action}`} style={{background:"#1E293B",borderRadius:8,padding:12,border:`1px solid ${a.status==="adjusted"?"#334155":a.color}30`,borderLeft:`4px solid ${a.color}`,opacity:a.status==="adjusted"||(a.action==="confirm"&&a.status==="confirmed")?.4:1}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,flexWrap:"wrap"}}>
+                <div style={{flex:1,minWidth:180}}>
+                  <div style={{display:"flex",alignItems:"center",gap:5,marginBottom:3}}><span style={{fontFamily:"monospace",fontWeight:700,color:"#E2E8F0",fontSize:12}}>{a.itemId}</span><span style={{color:"#475569"}}>·</span><span style={{color:"#94A3B8",fontSize:11}}>{a.description}</span></div>
+                  <div style={{fontSize:11,color:a.color,fontWeight:500,lineHeight:1.3}}>{a.actionText}</div>
+                  <div style={{fontSize:9,color:"#475569",marginTop:2}}>Bin: {a.actualBin&&a.actualBin!==a.binLocation?`${a.binLocation}→${a.actualBin}`:(a.binLocation||"—")} · {a.category||"—"}</div>
+                </div>
+                {a.status!=="adjusted"&&a.status!=="confirmed"?<button onClick={()=>markAdjusted(a.id)} style={{padding:"6px 12px",borderRadius:6,border:"none",background:a.action==="confirm"?"#059669":"#7C3AED",color:"#fff",fontSize:10,fontWeight:600,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>{a.action==="confirm"?"Confirm":"Done"}</button>:<span style={{color:"#A78BFA",fontSize:10,fontWeight:600}}>✓</span>}
+              </div>
+            </div>)}
+          </div></>}
+        </div>}
+
+        {/* PLAN — auto-updating */}
+        {view==="plan"&&<div>
+          <h2 style={{fontSize:16,fontWeight:700,color:"#F1F5F9",margin:"0 0 4px"}}>Recovery Plan</h2>
+          <p style={{fontSize:11,color:"#64748B",margin:"0 0 14px"}}>Auto-tasks update as you work. Manual tasks (Phase 4) can be toggled.</p>
+          {PHASES.map(phase=>{const pt=planTasks.filter(t=>t.phase===phase.id);const d=pt.filter(t=>t.done).length;return(
+            <div key={phase.id} style={{background:"#1E293B",borderRadius:10,padding:16,border:"1px solid #334155",marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:4,height:22,borderRadius:2,background:phase.color}}/><div><div style={{fontSize:9,fontWeight:700,letterSpacing:1.5,color:phase.color,textTransform:"uppercase"}}>Phase {phase.id}</div><div style={{fontSize:13,fontWeight:600,color:"#F1F5F9"}}>{phase.name}</div></div></div>
+                <span style={{fontSize:11,fontWeight:700,color:d===pt.length?"#34D399":"#94A3B8"}}>{d}/{pt.length}</span>
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                {pt.map(task=><div key={task.id} onClick={()=>!task.auto&&toggleManualTask(task.id)} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",borderRadius:6,background:task.done?"rgba(52,211,153,.06)":"#0F172A",border:`1px solid ${task.done?"rgba(52,211,153,.2)":"#1E3A5F"}`,cursor:task.auto?"default":"pointer",opacity:task.auto?1:.95}}>
+                  <div style={{width:16,height:16,borderRadius:4,border:`2px solid ${task.done?"#34D399":"#475569"}`,display:"flex",alignItems:"center",justifyContent:"center",background:task.done?"#34D399":"transparent",flexShrink:0}}>{task.done&&<span style={{color:"#0F172A",fontSize:10,fontWeight:800}}>✓</span>}</div>
+                  <span style={{fontSize:12,color:task.done?"#64748B":"#E2E8F0",textDecoration:task.done?"line-through":"none",flex:1}}>{task.text}</span>
+                  {task.auto&&<span style={{fontSize:8,color:"#475569",fontWeight:600,textTransform:"uppercase"}}>Auto</span>}
+                </div>)}
+              </div>
+            </div>);})}
+          <div style={{background:"#1E293B",borderRadius:10,padding:14,border:"1px solid #334155"}}>
+            <h3 style={{fontSize:12,fontWeight:600,color:"#94A3B8",marginTop:0,marginBottom:6}}>Notes</h3>
+            <textarea value={notes} onChange={e=>setNotes(e.target.value)} rows={2} placeholder="Observations, decisions..." style={{width:"100%",background:"#0F172A",border:"1px solid #334155",borderRadius:6,padding:8,color:"#E2E8F0",fontSize:12,resize:"vertical",boxSizing:"border-box"}}/>
+          </div>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// ADMIN DASHBOARD
+// ═══════════════════════════════════════════════════════════
+function AdminDashboard({ divisions, onBack }) {
+  const [divData, setDivData] = useState([]);
+  useEffect(() => {
+    (async () => {
+      const results = [];
+      for (const d of divisions) {
+        try {
+          const r = await store.get(SKEY(d.id));
+          if (r?.value) { const data = JSON.parse(r.value); const items = data.items || []; const s = calcStats(items); const actions = calcActions(items); const plan = calcPlanTasks(items, s, actions);
+            results.push({ ...d, items, stats: s, actions, plan, lastSaved: data.lastSaved, pct: Math.round(plan.filter(t=>t.done).length/plan.length*100) });
+          } else { results.push({ ...d, items:[], stats:calcStats([]), actions:[], plan:[], lastSaved:null, pct:0 }); }
+        } catch(e) { results.push({ ...d, items:[], stats:calcStats([]), actions:[], plan:[], lastSaved:null, pct:0 }); }
+      }
+      setDivData(results);
+    })();
+  }, [divisions]);
+
+  const allItems = divData.flatMap(d => d.items.map(i => ({ ...i, _div: d.name })));
+  const totals = calcStats(allItems);
+  const totalPct = divData.length ? Math.round(divData.reduce((s,d)=>s+d.pct,0)/divData.length) : 0;
+
+  return (
+    <div style={{fontFamily:"'IBM Plex Sans',-apple-system,sans-serif",background:"#0B1120",color:"#E2E8F0",minHeight:"100vh",padding:"20px 24px"}}>
+      <div style={{maxWidth:1200,margin:"0 auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div><div style={{fontSize:10,fontWeight:700,letterSpacing:2,color:"#F59E0B",textTransform:"uppercase"}}>Management View</div><h1 style={{fontSize:22,fontWeight:700,margin:0,color:"#F1F5F9"}}>Admin Dashboard</h1></div>
+          <button onClick={onBack} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #334155",background:"#1E293B",color:"#94A3B8",fontSize:12,cursor:"pointer"}}>← Back</button>
+        </div>
+
+        {/* Overall */}
+        <div style={{background:"#1E293B",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><span style={{fontSize:14,fontWeight:600,color:"#94A3B8"}}>All Divisions Combined</span><span style={{fontSize:22,fontWeight:800,color:"#60A5FA"}}>{totalPct}%</span></div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:8,marginTop:12}}>
+            {[["Total Parts",totals.total,"#60A5FA"],["Counted",totals.counted,"#34D399"],["Uncounted",totals.uncounted,totals.uncounted>0?"#FBBF24":"#34D399"],["Variances",totals.variances,totals.variances>0?"#F87171":"#34D399"],["$0 Cost",totals.zeroCost,totals.zeroCost>0?"#F59E0B":"#34D399"],["Not In Sys",totals.notInSystem,totals.notInSystem>0?"#E879F9":"#34D399"],["Adjusted",totals.adjusted,"#A78BFA"],["$ Impact",`$${totals.dollarImpact.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}`,"#F87171"]].map(([l,v,c],i)=><div key={i} style={{background:"#0F172A",borderRadius:8,padding:10,textAlign:"center"}}><div style={{fontSize:8,fontWeight:600,color:"#64748B",textTransform:"uppercase",marginBottom:2}}>{l}</div><div style={{fontSize:16,fontWeight:800,color:c}}>{v}</div></div>)}
+          </div>
+        </div>
+
+        {/* Per-division cards */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:14}}>
+          {divData.map(d => {
+            const s = d.stats;
+            return <div key={d.id} style={{background:"#1E293B",borderRadius:12,padding:18,border:"1px solid #334155"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                <h3 style={{fontSize:15,fontWeight:700,color:"#F1F5F9",margin:0}}>{d.name}</h3>
+                <span style={{fontSize:18,fontWeight:800,color:d.pct===100?"#34D399":d.pct>50?"#60A5FA":"#FBBF24"}}>{d.pct}%</span>
+              </div>
+              <div style={{background:"#0F172A",borderRadius:6,height:6,marginBottom:12}}><div style={{height:"100%",width:`${d.pct}%`,background:d.pct===100?"#34D399":"#2563EB",borderRadius:6}}/></div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:10}}>
+                {[["Parts",s.total],["Counted",s.counted],["Variance",s.variances],["Adjusted",s.adjusted]].map(([l,v],i)=><div key={i} style={{textAlign:"center"}}><div style={{fontSize:8,color:"#64748B",textTransform:"uppercase"}}>{l}</div><div style={{fontSize:14,fontWeight:700,color:"#E2E8F0"}}>{v}</div></div>)}
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#64748B"}}>
+                <span>$ Impact: <strong style={{color:"#F87171"}}>${s.dollarImpact.toFixed(2)}</strong></span>
+                <span>{d.lastSaved ? `Updated ${new Date(d.lastSaved).toLocaleDateString()}` : "Not started"}</span>
+              </div>
+            </div>;
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
+// ROOT APP — Division selector
+// ═══════════════════════════════════════════════════════════
+function App() {
+  const [screen, setScreen] = useState("select");
+  const [activeDivId, setActiveDivId] = useState(null);
+  const [activeDivName, setActiveDivName] = useState("");
+  const [divisions, setDivisions] = useState(DEFAULT_DIVS);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [pin, setPin] = useState("");
+  const [pinError, setPinError] = useState(false);
+  const [showAddDiv, setShowAddDiv] = useState(false);
+  const [newDivName, setNewDivName] = useState("");
+
+  useEffect(() => {
+    (async () => { try { const r = await store.get(DKEY); if (r?.value) setDivisions(JSON.parse(r.value)); } catch(e) {} })();
+  }, []);
+  useEffect(() => {
+    (async () => { try { await store.set(DKEY, JSON.stringify(divisions)); } catch(e) {} })();
+  }, [divisions]);
+
+  const openDiv = (d) => { setActiveDivId(d.id); setActiveDivName(d.name); setScreen("tracker"); };
+  const tryAdmin = () => { if (pin === ADMIN_PIN) { setShowAdmin(false); setPin(""); setPinError(false); setScreen("admin"); } else { setPinError(true); } };
+  const addDiv = () => { if (!newDivName.trim()) return; const id = newDivName.trim().toLowerCase().replace(/[^a-z0-9]+/g,"_"); setDivisions(p => [...p, { id, name: newDivName.trim() }]); setNewDivName(""); setShowAddDiv(false); };
+
+  if (screen === "tracker") return <DivisionTracker divId={activeDivId} divName={activeDivName} onBack={() => setScreen("select")} />;
+  if (screen === "admin") return <AdminDashboard divisions={divisions} onBack={() => setScreen("select")} />;
+
+  return (
+    <div style={{fontFamily:"'IBM Plex Sans',-apple-system,sans-serif",background:"#0B1120",color:"#E2E8F0",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+      <div style={{maxWidth:500,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:30}}>
+          <div style={{fontSize:10,fontWeight:700,letterSpacing:2,color:"#60A5FA",textTransform:"uppercase",marginBottom:4}}>HCSS E360 Operations Recovery</div>
+          <h1 style={{fontSize:24,fontWeight:700,color:"#F1F5F9",margin:0}}>Inventory Reconciliation</h1>
+          <p style={{fontSize:12,color:"#64748B",marginTop:6}}>Select your division to begin</p>
+        </div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
+          {divisions.map((d,i) => (
+            <button key={d.id} onClick={() => openDiv(d)} style={{padding:"14px 18px",borderRadius:10,border:"1px solid #334155",background:"#1E293B",color:"#F1F5F9",fontSize:15,fontWeight:600,cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between",transition:"border-color .15s"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <div style={{width:10,height:10,borderRadius:5,background:COLORS[i%COLORS.length]}}/>
+                {d.name}
+              </div>
+              <span style={{color:"#475569",fontSize:16}}>→</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Add division */}
+        {!showAddDiv ? (
+          <button onClick={() => setShowAddDiv(true)} style={{width:"100%",padding:"10px",borderRadius:8,border:"2px dashed #334155",background:"transparent",color:"#64748B",fontSize:12,fontWeight:600,cursor:"pointer",marginBottom:16}}>+ Add Division</button>
+        ) : (
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
+            <input value={newDivName} onChange={e => setNewDivName(e.target.value)} onKeyDown={e => e.key === "Enter" && addDiv()} placeholder="Division name..." style={{flex:1,padding:"8px 12px",borderRadius:8,border:"1px solid #334155",background:"#0F172A",color:"#E2E8F0",fontSize:13}}/>
+            <button onClick={addDiv} disabled={!newDivName.trim()} style={{padding:"8px 16px",borderRadius:8,border:"none",background:newDivName.trim()?"#2563EB":"#1E3A5F",color:newDivName.trim()?"#fff":"#475569",fontWeight:600,fontSize:12,cursor:newDivName.trim()?"pointer":"default"}}>Add</button>
+            <button onClick={() => {setShowAddDiv(false);setNewDivName("");}} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #334155",background:"transparent",color:"#64748B",fontSize:12,cursor:"pointer"}}>✕</button>
+          </div>
+        )}
+
+        {/* Admin */}
+        {!showAdmin ? (
+          <button onClick={() => setShowAdmin(true)} style={{width:"100%",padding:"10px",borderRadius:8,border:"1px solid #334155",background:"#1E293B",color:"#F59E0B",fontSize:12,fontWeight:600,cursor:"pointer"}}>Management Dashboard</button>
+        ) : (
+          <div style={{background:"#1E293B",borderRadius:10,padding:16,border:"1px solid #F59E0B30"}}>
+            <div style={{fontSize:13,fontWeight:600,color:"#F59E0B",marginBottom:8}}>Enter Admin PIN</div>
+            <div style={{display:"flex",gap:8}}>
+              <input type="password" value={pin} onChange={e => {setPin(e.target.value);setPinError(false);}} onKeyDown={e => e.key==="Enter"&&tryAdmin()} placeholder="PIN" style={{flex:1,padding:"8px 12px",borderRadius:8,border:`1px solid ${pinError?"#F87171":"#334155"}`,background:"#0F172A",color:"#E2E8F0",fontSize:14,textAlign:"center",letterSpacing:8}}/>
+              <button onClick={tryAdmin} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#F59E0B",color:"#0F172A",fontWeight:700,fontSize:12,cursor:"pointer"}}>Enter</button>
+              <button onClick={() => {setShowAdmin(false);setPin("");setPinError(false);}} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #334155",background:"transparent",color:"#64748B",fontSize:12,cursor:"pointer"}}>✕</button>
+            </div>
+            {pinError && <div style={{fontSize:11,color:"#F87171",marginTop:6}}>Incorrect PIN</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
